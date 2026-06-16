@@ -2,7 +2,7 @@
 
 ## Descripción
 
-Este documento explica el archivo [`test_mmap.c`](./test_mmap.c), que es un programa de prueba funcional para la nueva syscall `mmap` implementada en `selfie.c`.
+Este documento explica el archivo [`test_mmap.c`](./test_mmap.c), que es una suite de pruebas funcional y de robustez para la syscall `mmap` implementada en `selfie.c`.
 
 El programa está escrito en **C*** (el subconjunto de C que entiende el compilador `starc` de Selfie) y se ejecuta dentro del emulador `mipster`.
 
@@ -36,70 +36,62 @@ El resultado del programa aparece delimitado por:
 
 ---
 
-## Qué prueba el test
+## Qué evalúa la suite de pruebas (Pruebas de Robustez)
 
-### Escenario 1 — Primer `mmap` con dirección automática
+La suite de pruebas evalúa de manera rigurosa los límites, casos de éxito y de error de la syscall:
 
-```c
-addr1 = mmap(0, 4096, 0, fd, 0);
-```
+### 1. Mapeo estándar de éxito (`TEST 1`)
+* **Llamada**: `mmap(0, 4096, 0, fd, 0)`
+* **Objetivo**: Verificar que se asigne una dirección virtual libre (`addr != 0`) y no se retorne error (`addr != 4294967295`).
 
-| Argumento | Valor | Significado |
-|-----------|-------|-------------|
-| `addr` | `0` | Selfie elige automáticamente la dirección virtual |
-| `length` | `4096` | 1 página = `PAGESIZE` (alineación automática) |
-| `prot` | `0` | Solo lectura |
-| `fd` | `fd` | File descriptor de `selfie.c` (abierto con `open`) |
-| `offset` | `0` | Desde el inicio del archivo |
+### 2. Detección de `offset` desalineado (`TEST 2`)
+* **Llamada**: `mmap(0, 4096, 0, fd, 123)`
+* **Objetivo**: Asegurar que si el `offset` no es múltiplo de `PAGESIZE` (4096 bytes), la syscall falle devolviendo `-1` (`4294967295` tras encoger a 32 bits en Mipster).
 
-**Verificaciones:**
-- `addr1 != 0` → la dirección no es nula
-- `addr1 != -1` → no hubo error
+### 3. Validación de `length` igual a cero (`TEST 3`)
+* **Llamada**: `mmap(0, 0, 0, fd, 0)`
+* **Objetivo**: Validar que no se permitan mappings de tamaño cero, retornando error `-1` (`4294967295`).
 
----
+### 4. Redondeo automático de `length` (`TEST 4`)
+* **Llamada**: `mmap(0, 1, 0, fd, 0)`
+* **Objetivo**: Probar que una longitud pequeña (1 byte) sea redondeada internamente al múltiplo superior de página (4096 bytes). Para verificarlo, una llamada subsiguiente a `mmap` no debe solaparse con este espacio de 4096 bytes.
 
-### Escenario 2 — Segundo `mmap` con offset distinto
+### 5. Manejo robusto de `fd` inválido (`TEST 5`)
+* **Llamada**: `mmap(0, 4096, 0, 4294967295, 0)` (usando `-1` o `fd` erróneo)
+* **Objetivo**: Verificar que el emulador sea robusto y registre la asociación virtual de manera regular sin abortar ni arrojar fallos de segmentación.
 
-```c
-addr2 = mmap(0, 8192, 0, fd, 4096);
-```
-
-| Argumento | Valor | Significado |
-|-----------|-------|-------------|
-| `addr` | `0` | Auto-asignado |
-| `length` | `8192` | 2 páginas (alineado a `PAGESIZE`) |
-| `prot` | `0` | Solo lectura |
-| `fd` | `fd` | Mismo file descriptor |
-| `offset` | `4096` | Desde la segunda página del archivo |
-
-**Verificaciones:**
-- `addr2 != 0` y `addr2 != -1`
-- `addr1 != addr2` → las regiones son distintas
-- `addr2 >= addr1 + 4096` → no hay solapamiento de memoria virtual
+### 6. Control de no solapamiento (`TEST 6`)
+* **Objetivo**: Compara todas las direcciones virtuales mapeadas de forma consecutiva (`addr1`, `addr_align`, `addr_next`, `addr2`) para certificar que el algoritmo de asignación de direcciones virtuales evita colisiones.
 
 ---
 
 ## Resultado esperado (salida exitosa)
 
-```
+```text
 ./selfie: 64-bit mipster executing 64-bit RISC-U binary test_mmap.c with 128MB physical memory
 ./selfie: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
-mmap TEST EXITOSO!
-- mmap 1: OK (4096 bytes, offset=0)
-- mmap 2: OK (8192 bytes, offset=4096)
-- sin solapamiento: OK
-- addr2 > addr1: OK
+--- INICIANDO PRUEBAS DE ROBUSTEZ DE MMAP ---
+TEST 1 PASS: Mapeo basico exitoso
+./selfie: mmap offset 123 is not page-aligned
+TEST 2 PASS: offset no alineado detectado correctamente y retorna -1
+./selfie: mmap length must be greater than zero
+TEST 3 PASS: longitud cero detectada correctamente y retorna -1
+TEST 4 PASS: Redondeo de longitud no alineada a PAGESIZE funciona correctamente
+TEST 5 PASS: mmap con fd invalido maneja la peticion con robustez
+TEST 6 PASS: Todos los mappings contiguos no se solapan
+
+--- TODAS LAS PRUEBAS DE ROBUSTEZ PASARON CON EXITO ---
 
 ./selfie: <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 ./selfie: 64-bit mipster terminating 64-bit RISC-U binary test_mmap.c with exit code 0
 ```
 
 **Indicadores de éxito:**
-- ✅ `exit code 0` → sin errores
-- ✅ Sin `segmentation fault` ni `uncaught exception`
-- ✅ Los 4 mensajes de `OK` aparecen dentro del bloque `>>>...<<<`
-- ✅ El resumen de memoria muestra estabilidad (≈ 0.02MB mapeado)
+- ✅ `exit code 0` → sin errores en el proceso de prueba
+- ✅ Mensajes explícitos `TEST X PASS` en cada caso crítico de robustez
+- ✅ Mensaje final `TODAS LAS PRUEBAS DE ROBUSTEZ PASARON CON EXITO`
+- ✅ Sin fallos de segmentación en el emulador de Selfie
 
 ---
 
@@ -118,22 +110,7 @@ La syscall implementada en `selfie.c` sigue el patrón estándar:
 
 - **`addr == 0`** → se elige automáticamente desde `program_break`, evitando solapamientos con mappings existentes
 - **`length`** → redondeado al múltiplo de `PAGESIZE (4096)` más cercano
-- **`offset`** → debe ser múltiplo de `PAGESIZE`, si no retorna `-1`
+- **`offset`** → debe ser múltiplo de `PAGESIZE`, si no retorna `-1` (encogido a 32 bits en la syscall)
 - **No escribe en el archivo** → solo registra la relación virtual/física en el contexto
 - **PC se incrementa** → `set_pc(context, get_pc(context) + INSTRUCTIONSIZE)` al finalizar
 
----
-
-## Verificación del resumen de ejecución
-
-Al final de la ejecución, `mipster` reporta:
-
-```
-./selfie: summary: 243 executed instructions in total
-./selfie:          0.02MB mapped memory [0.01% of 128MB physical memory]
-./selfie:          11 exceptions handled (9 syscalls, 1 page fault, 0 timers)
-```
-
-- **`0.02MB` de memoria mapeada** → el page cache opera de forma estable, sin fugas
-- **`8 syscalls`** → `open` + 2×`mmap` + 5×`write` = correctas
-- **`exit code 0`** → ejecución completamente exitosa
