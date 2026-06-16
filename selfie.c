@@ -1290,6 +1290,9 @@ void 	implement_fork(uint64_t* context);
 void	emit_wait();
 void	implement_wait(uint64_t* context);
 
+void emit_mmap();
+void implement_mmap(uint64_t* context);
+
 uint64_t is_boot_level_zero();
 
 // ------------------------ GLOBAL CONSTANTS -----------------------
@@ -1307,6 +1310,9 @@ uint64_t SYSCALL_BRK    = 214;
 
 uint64_t SYSCALL_FORK	= 215;
 uint64_t SYSCALL_WAIT	= 216;
+uint64_t SYSCALL_MMAP   = 222;
+
+uint64_t debug_mmap = 0;
 
 /* DIRFD_AT_FDCWD corresponds to AT_FDCWD in fcntl.h and
    is passed as first argument of the openat system call
@@ -2226,11 +2232,12 @@ void unblock_context(uint64_t* context);
 // | 35 | number of children	| number of forked children
 // | 36 | child exit code		| exit status code of last exited child
 // | 37 | child pid				| pid of exited child
+// | 38 | mappings        | pointer to head of mmap mapping list
 
 // number of entries of a machine context:
-// 14 uint64_t + 6 uint64_t* + 1 char* + 7 uint64_t + 2 uint64_t* + 2 uint64_t entries
+// 14 uint64_t + 6 uint64_t* + 1 char* + 7 uint64_t + 2 uint64_t* + 2 uint64_t + 1 uint64_t* entries
 // extended in the symbolic execution engine and the Boehm garbage collector
-uint64_t CONTEXTENTRIES = 38;
+uint64_t CONTEXTENTRIES = 39;
 uint64_t N_CONTEXTS = 0;
 uint64_t* RUNNING = (uint64_t*) 0;
 uint64_t N_BLOCKED_CONTEXTS = 0;
@@ -2370,6 +2377,10 @@ void set_status(uint64_t* context, uint64_t status) { *(context + 34) = status; 
 void set_nchildren(uint64_t* context, uint64_t nchildren) { *(context + 35) = nchildren; }
 void set_child_exit_code(uint64_t* context, uint64_t exit_code) { *(context + 36) = exit_code; }
 void set_child_pid(uint64_t* context, uint64_t child_pid) { *(context + 37) = child_pid; }
+
+uint64_t  mappings_offset(uint64_t* context)              { return (uint64_t) (context + 38); }
+uint64_t* get_mappings(uint64_t* context)                 { return (uint64_t*) *(context + 38); }
+void      set_mappings(uint64_t* context, uint64_t* m)    { *(context + 38) = (uint64_t) m; }
 
 // -----------------------------------------------------------------
 // -------------------------- MICROKERNEL --------------------------
@@ -6342,6 +6353,7 @@ void selfie_compile() {
   emit_fork();
   emit_wait();
   emit_open();
+  emit_mmap();
 
   emit_malloc();
 
@@ -8168,7 +8180,160 @@ void implement_wait(uint64_t* context) {
 	}
 }
 
+// -----------------------------------------------------------------
+// ------------------------- MMAP SYSCALL -------------------------
+// -----------------------------------------------------------------
+
+// mmap mapping entry
+// +---+------------+
+// | 0 | next       | pointer to next mapping entry (linked list)
+// | 1 | vaddr      | virtual address base of this mapping
+// | 2 | length     | size of mapping in bytes (aligned to PAGESIZE)
+// | 3 | fd         | file descriptor (local to the process)
+// | 4 | file_offset| offset within the file
+// | 5 | prot       | protection flags (0=R, 1=W, 2=RW)
+// +---+------------+
+
+void emit_mmap() {
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("mmap"),
+    0, PROCEDURE, UINT64_T, 5, code_size);
+
+  emit_load(REG_A0, REG_SP, 0); // addr
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A1, REG_SP, 0); // length
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A2, REG_SP, 0); // prot
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A3, REG_SP, 0); // fd
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A4, REG_SP, 0); // offset
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_MMAP);
+
+  emit_ecall();
+
+  // return value is in REG_A0 (the mapped virtual address)
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void implement_mmap(uint64_t* context) {
+  // parameters
+  uint64_t addr;
+  uint64_t length;
+  uint64_t prot;
+  uint64_t fd;
+  uint64_t offset;
+
+  // local variables
+  uint64_t aligned_length;
+  uint64_t mapped_addr;
+  uint64_t* mapping;
+  uint64_t* existing;
+  uint64_t candidate;
+  uint64_t conflict;
+
+  addr   = *(get_regs(context) + REG_A0);
+  length = *(get_regs(context) + REG_A1);
+  prot   = *(get_regs(context) + REG_A2);
+  fd     = *(get_regs(context) + REG_A3);
+  offset = *(get_regs(context) + REG_A4);
+
+  if (debug_syscalls) {
+    printf("(mmap): addr=0x%lX length=%lu prot=%lu fd=%lu offset=%lu |- ",
+      addr, length, prot, fd, offset);
+  }
+
+  // validate offset must be page-aligned
+  if (offset % PAGESIZE != 0) {
+    printf("%s: mmap offset %lu is not page-aligned\n", selfie_name, offset);
+    *(get_regs(context) + REG_A0) = sign_shrink(-1, SYSCALL_BITWIDTH);
+    set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+    return;
+  }
+
+  // validate length > 0
+  if (length == 0) {
+    printf("%s: mmap length must be greater than zero\n", selfie_name);
+    *(get_regs(context) + REG_A0) = sign_shrink(-1, SYSCALL_BITWIDTH);
+    set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+    return;
+  }
+
+  // round length up to nearest multiple of PAGESIZE
+  aligned_length = round_up(length, PAGESIZE);
+
+  if (addr == 0) {
+    // auto-select a free virtual address region.
+    // Start from the current program break (top of heap) and search upwards
+    // for a region of size aligned_length that does not overlap any existing
+    // mmap mapping.
+    candidate = get_program_break(context);
+
+    // align candidate to page boundary
+    candidate = round_up(candidate, PAGESIZE);
+
+    // linear scan to find a non-overlapping region
+    conflict = 1;
+    while (conflict) {
+      conflict = 0;
+      existing = get_mappings(context);
+      while (existing != (uint64_t*) 0) {
+        uint64_t ex_start;
+        uint64_t ex_end;
+        ex_start = *(existing + 1); // vaddr
+        ex_end   = ex_start + *(existing + 2); // vaddr + length
+        // check overlap: [candidate, candidate+aligned_length) vs [ex_start, ex_end)
+        if (candidate < ex_end && candidate + aligned_length > ex_start) {
+          // overlap detected, move candidate past this mapping
+          candidate = ex_end;
+          candidate = round_up(candidate, PAGESIZE);
+          conflict = 1;
+        }
+        existing = (uint64_t*) *existing; // next
+      }
+    }
+
+    mapped_addr = candidate;
+  } else {
+    // use the caller-specified address (page-aligned)
+    mapped_addr = round_up(addr, PAGESIZE);
+  }
+
+  // create and insert the mapping entry at the head of the context's list
+  // entry layout: [next, vaddr, length, fd, offset, prot]
+  mapping = smalloc(6 * sizeof(uint64_t));
+
+  *(mapping + 0) = (uint64_t) get_mappings(context); // next
+  *(mapping + 1) = mapped_addr;                       // vaddr
+  *(mapping + 2) = aligned_length;                    // length (page-aligned)
+  *(mapping + 3) = fd;                                // file descriptor (process-local)
+  *(mapping + 4) = offset;                            // file offset
+  *(mapping + 5) = prot;                              // protection flags
+
+  set_mappings(context, mapping);
+
+  if (debug_mmap)
+    printf("%s: mmap fd=%lu offset=%lu length=%lu -> virtual address 0x%08lX\n",
+      selfie_name, fd, offset, aligned_length, mapped_addr);
+
+  // return the assigned virtual address
+  *(get_regs(context) + REG_A0) = mapped_addr;
+
+  // CRITICAL: advance the program counter so execution does not freeze
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+
+  if (debug_syscalls) {
+    printf(" -> 0x%lX\n", mapped_addr);
+  }
+}
+
 uint64_t is_boot_level_zero() {
+
   // C99 malloc(0) returns either a null pointer or a unique pointer,
   // see http://pubs.opengroup.org/onlinepubs/9699919799
   // in contrast, selfie's malloc(0) returns the same not null address,
@@ -10156,7 +10321,11 @@ void do_ecall() {
 					read_register(REG_A2);
 
 					if (*(registers + REG_A7) == SYSCALL_OPENAT)
-					read_register(REG_A3);
+						read_register(REG_A3);
+					else if (*(registers + REG_A7) == SYSCALL_MMAP) {
+						read_register(REG_A3);
+						read_register(REG_A4);
+					}
 				}
 			}
 
@@ -11783,6 +11952,8 @@ uint64_t handle_system_call(uint64_t* context) {
     implement_fork(context);
   else if (a7 == SYSCALL_WAIT)
     implement_wait(context);
+  else if (a7 == SYSCALL_MMAP)
+    implement_mmap(context);
   else if (a7 == SYSCALL_EXIT) {
     implement_exit(context);
 
