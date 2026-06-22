@@ -104,6 +104,9 @@ uint64_t write(uint64_t fd, uint64_t* buffer, uint64_t bytes_to_write);
 uint64_t open(char* filename, uint64_t flags, ...);
 int fork();
 uint64_t wait(uint64_t* wstatus);
+// selfie bootstraps off_t to uint64_t!
+uint64_t lseek(uint64_t fd, uint64_t offset, uint64_t whence);
+
 // selfie bootstraps void* to uint64_t* and unsigned to uint64_t!
 void* malloc(unsigned long);
 
@@ -1293,6 +1296,18 @@ void	implement_wait(uint64_t* context);
 void emit_mmap();
 void implement_mmap(uint64_t* context);
 
+void emit_munmap();
+void implement_munmap(uint64_t* context);
+
+void emit_msync();
+void implement_msync(uint64_t* context);
+
+// page cache functions
+void      init_page_cache();
+uint64_t* alloc_cache_frame();
+uint64_t* find_cache_frame(uint64_t file_id, uint64_t page_offset);
+void      insert_cache_entry(uint64_t file_id, uint64_t page_offset, uint64_t* frame);
+
 uint64_t is_boot_level_zero();
 
 // ------------------------ GLOBAL CONSTANTS -----------------------
@@ -1311,8 +1326,17 @@ uint64_t SYSCALL_BRK    = 214;
 uint64_t SYSCALL_FORK	= 215;
 uint64_t SYSCALL_WAIT	= 216;
 uint64_t SYSCALL_MMAP   = 222;
+uint64_t SYSCALL_MUNMAP = 223;
+uint64_t SYSCALL_MSYNC  = 224;
 
 uint64_t debug_mmap = 0;
+
+// ----------------------- PAGE CACHE -------------------------
+
+uint64_t  MAX_CACHE_FRAMES   = 256;           // max cache frames (physical pages for files)
+uint64_t* cache_frame_memory = (uint64_t*) 0;  // pool of memory for cache frames
+uint64_t  cache_frame_next   = 0;              // index of next free cache frame
+uint64_t* page_cache_head    = (uint64_t*) 0;  // head of page cache entry linked list
 
 /* DIRFD_AT_FDCWD corresponds to AT_FDCWD in fcntl.h and
    is passed as first argument of the openat system call
@@ -6354,6 +6378,8 @@ void selfie_compile() {
   emit_wait();
   emit_open();
   emit_mmap();
+  emit_munmap();
+  emit_msync();
 
   emit_malloc();
 
@@ -8131,6 +8157,46 @@ void implement_fork(uint64_t* context) {
 
 	set_nchildren(context, get_nchildren(context) + 1);
 
+	/* Inherit mmap mappings: copy list and share cache frames */
+	{
+		uint64_t* pm;
+		uint64_t* cm_head;
+		uint64_t* cm;
+		uint64_t m_vaddr;
+		uint64_t m_len;
+		uint64_t pg;
+		uint64_t* fr;
+
+		pm = get_mappings(context);
+		cm_head = (uint64_t*) 0;
+
+		while (pm != (uint64_t*) 0) {
+			cm = smalloc(6 * sizeof(uint64_t));
+			*(cm + 0) = (uint64_t) cm_head;
+			*(cm + 1) = *(pm + 1);
+			*(cm + 2) = *(pm + 2);
+			*(cm + 3) = *(pm + 3);
+			*(cm + 4) = *(pm + 4);
+			*(cm + 5) = *(pm + 5);
+			cm_head = cm;
+
+			m_vaddr = *(pm + 1);
+			m_len   = *(pm + 2);
+			pg = 0;
+			while (pg < m_len) {
+				if (is_virtual_address_mapped(get_pt(context), m_vaddr + pg)) {
+					fr = (uint64_t*) get_frame_for_page(get_pt(context), get_page_of_virtual_address(m_vaddr + pg));
+					map_page(child, get_page_of_virtual_address(m_vaddr + pg), (uint64_t) fr);
+				}
+				pg = pg + PAGESIZE;
+			}
+
+			pm = (uint64_t*) *(pm + 0);
+		}
+
+		set_mappings(child, cm_head);
+	}
+
 	*(get_regs(context) + REG_A0) = get_pid(child);
 	*(get_regs(child) + REG_A0) = 0;
 
@@ -8181,7 +8247,61 @@ void implement_wait(uint64_t* context) {
 }
 
 // -----------------------------------------------------------------
-// ------------------------- MMAP SYSCALL -------------------------
+// ----------------------- PAGE CACHE FUNCTIONS --------------------
+// -----------------------------------------------------------------
+
+void init_page_cache() {
+  uint64_t total_bytes;
+
+  // each cache frame = PAGESIZE bytes
+  // on 64-bit host with 64-bit target: sizeof(uint64_t)/WORDSIZE = 1
+  total_bytes = MAX_CACHE_FRAMES * PAGESIZE * (sizeof(uint64_t) / WORDSIZE);
+  cache_frame_memory = zmalloc(total_bytes);
+  cache_frame_next   = 0;
+  page_cache_head    = (uint64_t*) 0;
+}
+
+uint64_t* alloc_cache_frame() {
+  uint64_t* frame;
+  uint64_t  offset_bytes;
+
+  if (cache_frame_next >= MAX_CACHE_FRAMES)
+    return (uint64_t*) 0;
+
+  offset_bytes = cache_frame_next * PAGESIZE * (sizeof(uint64_t) / WORDSIZE);
+  frame = (uint64_t*) ((uint64_t) cache_frame_memory + offset_bytes);
+  cache_frame_next = cache_frame_next + 1;
+
+  return frame;
+}
+
+uint64_t* find_cache_frame(uint64_t file_id, uint64_t page_offset) {
+  uint64_t* entry;
+
+  entry = page_cache_head;
+  while (entry != (uint64_t*) 0) {
+    if (*(entry + 0) == file_id)
+      if (*(entry + 1) == page_offset)
+        return (uint64_t*) *(entry + 2);
+    entry = (uint64_t*) *(entry + 3);
+  }
+
+  return (uint64_t*) 0;
+}
+
+void insert_cache_entry(uint64_t file_id, uint64_t page_offset, uint64_t* frame) {
+  uint64_t* entry;
+
+  entry = smalloc(4 * sizeof(uint64_t));
+  *(entry + 0) = file_id;
+  *(entry + 1) = page_offset;
+  *(entry + 2) = (uint64_t) frame;
+  *(entry + 3) = (uint64_t) page_cache_head;
+  page_cache_head = entry;
+}
+
+// -----------------------------------------------------------------
+// ---------------------- MMAP / MUNMAP / MSYNC --------------------
 // -----------------------------------------------------------------
 
 // mmap mapping entry
@@ -8268,13 +8388,8 @@ void implement_mmap(uint64_t* context) {
   aligned_length = round_up(length, PAGESIZE);
 
   if (addr == 0) {
-    // auto-select a free virtual address region.
-    // Start from the current program break (top of heap) and search upwards
-    // for a region of size aligned_length that does not overlap any existing
-    // mmap mapping.
+    // auto-select a free virtual address region
     candidate = get_program_break(context);
-
-    // align candidate to page boundary
     candidate = round_up(candidate, PAGESIZE);
 
     // linear scan to find a non-overlapping region
@@ -8285,35 +8400,32 @@ void implement_mmap(uint64_t* context) {
       while (existing != (uint64_t*) 0) {
         uint64_t ex_start;
         uint64_t ex_end;
-        ex_start = *(existing + 1); // vaddr
-        ex_end   = ex_start + *(existing + 2); // vaddr + length
-        // check overlap: [candidate, candidate+aligned_length) vs [ex_start, ex_end)
-        if (candidate < ex_end && candidate + aligned_length > ex_start) {
-          // overlap detected, move candidate past this mapping
-          candidate = ex_end;
-          candidate = round_up(candidate, PAGESIZE);
-          conflict = 1;
-        }
-        existing = (uint64_t*) *existing; // next
+        ex_start = *(existing + 1);
+        ex_end   = ex_start + *(existing + 2);
+        if (candidate < ex_end)
+          if (candidate + aligned_length > ex_start) {
+            candidate = ex_end;
+            candidate = round_up(candidate, PAGESIZE);
+            conflict = 1;
+          }
+        existing = (uint64_t*) *existing;
       }
     }
 
     mapped_addr = candidate;
   } else {
-    // use the caller-specified address (page-aligned)
     mapped_addr = round_up(addr, PAGESIZE);
   }
 
-  // create and insert the mapping entry at the head of the context's list
-  // entry layout: [next, vaddr, length, fd, offset, prot]
+  // register the mapping in the process context
   mapping = smalloc(6 * sizeof(uint64_t));
 
-  *(mapping + 0) = (uint64_t) get_mappings(context); // next
-  *(mapping + 1) = mapped_addr;                       // vaddr
-  *(mapping + 2) = aligned_length;                    // length (page-aligned)
-  *(mapping + 3) = fd;                                // file descriptor (process-local)
-  *(mapping + 4) = offset;                            // file offset
-  *(mapping + 5) = prot;                              // protection flags
+  *(mapping + 0) = (uint64_t) get_mappings(context);
+  *(mapping + 1) = mapped_addr;
+  *(mapping + 2) = aligned_length;
+  *(mapping + 3) = fd;
+  *(mapping + 4) = offset;
+  *(mapping + 5) = prot;
 
   set_mappings(context, mapping);
 
@@ -8330,6 +8442,151 @@ void implement_mmap(uint64_t* context) {
   if (debug_syscalls) {
     printf(" -> 0x%lX\n", mapped_addr);
   }
+}
+
+// -----------------------------------------------------------------
+
+void emit_munmap() {
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("munmap"),
+    0, PROCEDURE, UINT64_T, 1, code_size);
+
+  emit_load(REG_A0, REG_SP, 0); // addr
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_MUNMAP);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void implement_munmap(uint64_t* context) {
+  uint64_t addr;
+  uint64_t* current;
+  uint64_t* prev;
+  uint64_t m_vaddr;
+  uint64_t m_len;
+  uint64_t pg;
+  uint64_t vpage;
+
+  addr = *(get_regs(context) + REG_A0);
+
+  if (debug_syscalls)
+    printf("(munmap): addr=0x%lX |- ", addr);
+
+  // find the mapping whose vaddr == addr
+  current = get_mappings(context);
+  prev = (uint64_t*) 0;
+
+  while (current != (uint64_t*) 0) {
+    if (*(current + 1) == addr) {
+      // found — remove from the linked list
+      m_vaddr = *(current + 1);
+      m_len   = *(current + 2);
+
+      // unmap virtual pages (set frame=0 in page table) if they were loaded
+      pg = 0;
+      while (pg < m_len) {
+        if (is_virtual_address_mapped(get_pt(context), m_vaddr + pg)) {
+          vpage = get_page_of_virtual_address(m_vaddr + pg);
+          set_PTE_for_page(get_pt(context), vpage, 0);
+        }
+        pg = pg + PAGESIZE;
+      }
+
+      // remove node from linked list
+      if (prev == (uint64_t*) 0)
+        set_mappings(context, (uint64_t*) *(current + 0));
+      else
+        *(prev + 0) = *(current + 0);
+
+      // return 0 = success
+      *(get_regs(context) + REG_A0) = 0;
+      set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+
+      if (debug_syscalls)
+        printf(" -> 0 (success)\n");
+      return;
+    }
+    prev = current;
+    current = (uint64_t*) *(current + 0);
+  }
+
+  // mapping not found
+  printf("%s: munmap address 0x%lX not found in mappings\n", selfie_name, addr);
+  *(get_regs(context) + REG_A0) = sign_shrink(-1, SYSCALL_BITWIDTH);
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+
+  if (debug_syscalls)
+    printf(" -> -1 (not found)\n");
+}
+
+// -----------------------------------------------------------------
+
+void emit_msync() {
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("msync"),
+    0, PROCEDURE, UINT64_T, 1, code_size);
+
+  emit_load(REG_A0, REG_SP, 0); // addr
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_MSYNC);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void implement_msync(uint64_t* context) {
+  uint64_t addr;
+  uint64_t* mapping;
+  uint64_t m_len;
+  uint64_t m_fd;
+  uint64_t m_off;
+  uint64_t pg;
+  uint64_t* frame;
+
+  addr = *(get_regs(context) + REG_A0);
+
+  if (debug_syscalls)
+    printf("(msync): addr=0x%lX |- ", addr);
+
+  // find the mapping whose vaddr == addr
+  mapping = get_mappings(context);
+  while (mapping != (uint64_t*) 0) {
+    if (*(mapping + 1) == addr) {
+      m_len   = *(mapping + 2);
+      m_fd    = *(mapping + 3);
+      m_off   = *(mapping + 4);
+
+      // write each cache frame back to the file
+      pg = 0;
+      while (pg < m_len) {
+        frame = find_cache_frame(m_fd, m_off + pg);
+        if (frame != (uint64_t*) 0) {
+          lseek(m_fd, m_off + pg, 0);
+          write(m_fd, frame, PAGESIZE);
+        }
+        pg = pg + PAGESIZE;
+      }
+
+      *(get_regs(context) + REG_A0) = 0;
+      set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+
+      if (debug_syscalls)
+        printf(" -> 0 (synced)\n");
+      return;
+    }
+    mapping = (uint64_t*) *(mapping + 0);
+  }
+
+  // mapping not found
+  printf("%s: msync address 0x%lX not found in mappings\n", selfie_name, addr);
+  *(get_regs(context) + REG_A0) = sign_shrink(-1, SYSCALL_BITWIDTH);
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+
+  if (debug_syscalls)
+    printf(" -> -1 (not found)\n");
 }
 
 uint64_t is_boot_level_zero() {
@@ -11689,6 +11946,24 @@ uint64_t is_data_stack_heap_address(uint64_t* context, uint64_t vaddr) {
     return 0;
 }
 
+uint64_t is_mmap_address(uint64_t* context, uint64_t vaddr) {
+  uint64_t* m;
+  uint64_t m_start;
+  uint64_t m_end;
+
+  m = get_mappings(context);
+  while (m != (uint64_t*) 0) {
+    m_start = *(m + 1);
+    m_end   = m_start + *(m + 2);
+    if (vaddr >= m_start)
+      if (vaddr < m_end)
+        return 1;
+    m = (uint64_t*) *(m + 0);
+  }
+
+  return 0;
+}
+
 uint64_t is_valid_segment_read(uint64_t vaddr) {
   if (is_data_address(current_context, vaddr)) {
     data_reads = data_reads + 1;
@@ -11701,6 +11976,8 @@ uint64_t is_valid_segment_read(uint64_t vaddr) {
   } else if (is_heap_address(current_context, vaddr)) {
     heap_reads = heap_reads + 1;
 
+    return 1;
+  } else if (is_mmap_address(current_context, vaddr)) {
     return 1;
   } else
     return 0;
@@ -11718,6 +11995,8 @@ uint64_t is_valid_segment_write(uint64_t vaddr) {
   } else if (is_heap_address(current_context, vaddr)) {
     heap_writes = heap_writes + 1;
 
+    return 1;
+  } else if (is_mmap_address(current_context, vaddr)) {
     return 1;
   } else
     return 0;
@@ -11954,6 +12233,10 @@ uint64_t handle_system_call(uint64_t* context) {
     implement_wait(context);
   else if (a7 == SYSCALL_MMAP)
     implement_mmap(context);
+  else if (a7 == SYSCALL_MUNMAP)
+    implement_munmap(context);
+  else if (a7 == SYSCALL_MSYNC)
+    implement_msync(context);
   else if (a7 == SYSCALL_EXIT) {
     implement_exit(context);
 
@@ -11974,12 +12257,51 @@ uint64_t handle_system_call(uint64_t* context) {
 
 uint64_t handle_page_fault(uint64_t* context) {
   uint64_t page;
+  uint64_t fault_addr;
+  uint64_t* m;
+  uint64_t m_start;
+  uint64_t m_end;
+  uint64_t file_offset;
+  uint64_t* frame;
 
   set_exception(context, EXCEPTION_NOEXCEPTION);
 
   set_ec_page_fault(context, get_ec_page_fault(context) + 1);
 
   page = get_fault(context);
+  fault_addr = get_virtual_address_of_page_start(page);
+
+  // Check if fault is in an mmap region
+  m = get_mappings(context);
+  while (m != (uint64_t*) 0) {
+    m_start = *(m + 1);
+    m_end   = m_start + *(m + 2);
+    if (fault_addr >= m_start) {
+      if (fault_addr < m_end) {
+        // Demand Paging for mmap
+        file_offset = *(m + 4) + (fault_addr - m_start);
+        
+        // Find cache frame
+        frame = find_cache_frame(*(m + 3), file_offset);
+        if (frame == (uint64_t*) 0) {
+          frame = alloc_cache_frame();
+          if (frame != (uint64_t*) 0) {
+            lseek(*(m + 3), file_offset, 0);
+            read(*(m + 3), frame, PAGESIZE);
+            insert_cache_entry(*(m + 3), file_offset, frame);
+          } else {
+             printf("%s: mmap out of cache frames\n", selfie_name);
+             set_exit_code(context, EXITCODE_OUTOFPHYSICALMEMORY);
+             return EXIT;
+          }
+        }
+        
+        map_page(context, page, (uint64_t) frame);
+        return DONOTEXIT;
+      }
+    }
+    m = (uint64_t*) *(m + 0);
+  }
 
   if (pavailable()) {
     // TODO: reuse frames
@@ -12370,6 +12692,8 @@ uint64_t selfie_run(uint64_t machine, uint64_t nproc) {
   } else {
 	init_memory(atoi(peek_argument(0)));
   }
+
+  init_page_cache();
 
   current_context = create_context(MY_CONTEXT, 0);
   boot_loader(current_context);
