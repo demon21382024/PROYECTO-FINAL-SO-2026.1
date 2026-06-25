@@ -1,19 +1,3 @@
-// test_mmap_shared.c
-// Demuestra que dos procesos (padre e hijo creado con fork) que mapean el
-// MISMO archivo COMPARTEN los mismos cache frames: un cambio hecho por uno es
-// visible para el otro a traves de la memoria (sin pasar por disco, sin msync).
-//
-// Flujo:
-//   1. crear el archivo con contenido inicial "AAAAAAAA"
-//   2. abrir y mapear el archivo ANTES del fork (el hijo hereda el mapping)
-//   3. el padre accede una vez -> demand paging carga el cache frame
-//   4. fork(): el hijo hereda el mapping apuntando al MISMO cache frame
-//   5. el hijo escribe "BBBBBBBB" en la memoria mapeada y termina
-//   6. el padre, tras wait(), lee la memoria mapeada y observa "BBBBBBBB"
-//      => prueba que el cache frame es compartido entre procesos
-//
-// Cubre el caso 3 de info_tests.md y el entregable #5 del enunciado.
-
 uint64_t* ptr;
 uint64_t* buf;
 

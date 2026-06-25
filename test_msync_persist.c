@@ -1,17 +1,3 @@
-// test_msync_persist.c
-// Demuestra que msync PERSISTE en disco los cambios hechos sobre un mapping.
-//
-// Flujo:
-//   1. crear el archivo con contenido inicial "AAAAAAAA"
-//   2. abrir el mismo archivo en O_RDWR y mapearlo con prot de escritura
-//   3. leer desde el mapping  -> dispara demand paging (carga el archivo)
-//   4. modificar la memoria mapeada -> "BBBBBBBB"
-//   5. msync(addr)            -> escribe el cache frame de vuelta al archivo
-//   6. reabrir el archivo con un fd NUEVO y leer directamente de disco
-//   7. verificar que el contenido en memoria secundaria cambio
-//
-// Cubre el caso 2 de info_tests.md y el entregable #4 del enunciado.
-
 uint64_t* buf;
 uint64_t* ptr;
 
