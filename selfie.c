@@ -2431,6 +2431,7 @@ uint64_t is_heap_address(uint64_t* context, uint64_t vaddr);
 
 uint64_t is_address_between_stack_and_heap(uint64_t* context, uint64_t vaddr);
 uint64_t is_data_stack_heap_address(uint64_t* context, uint64_t vaddr);
+uint64_t is_mmap_address(uint64_t* context, uint64_t vaddr);
 
 uint64_t is_valid_segment_read(uint64_t vaddr);
 uint64_t is_valid_segment_write(uint64_t vaddr);
@@ -8116,20 +8117,38 @@ void implement_fork(uint64_t* context) {
 		i = i + 1;
 	}
 
-	/* Copy low pages */
+	/* Copy low pages (skip unmapped gaps; mmap pages are shared below) */
 	page = get_lowest_lo_page(context);
 	vaddr = page * PAGESIZE;
 	while (get_page_of_virtual_address(vaddr) < get_highest_lo_page(context)) {
-		map_and_store (child, vaddr, load_virtual_memory(get_pt(context), vaddr));
-		vaddr = vaddr + WORDSIZE;
+		if (is_virtual_address_mapped(get_pt(context), vaddr)) {
+			if (is_mmap_address(context, vaddr))
+				// shared, not copied: handled by the mmap inheritance block below
+				vaddr = (get_page_of_virtual_address(vaddr) + 1) * PAGESIZE;
+			else {
+				map_and_store (child, vaddr, load_virtual_memory(get_pt(context), vaddr));
+				vaddr = vaddr + WORDSIZE;
+			}
+		} else
+			// unmapped page (gap between segments): skip the whole page
+			vaddr = (get_page_of_virtual_address(vaddr) + 1) * PAGESIZE;
 	}
 
-	/* Copy high pages */
+	/* Copy high pages (skip unmapped gaps; mmap pages are shared below) */
 	page = get_lowest_hi_page(context);
 	vaddr = page * PAGESIZE;
 	while (get_page_of_virtual_address(vaddr) < get_highest_hi_page(context)) {
-		map_and_store (child, vaddr, load_virtual_memory(get_pt(context), vaddr));
-		vaddr = vaddr + WORDSIZE;
+		if (is_virtual_address_mapped(get_pt(context), vaddr)) {
+			if (is_mmap_address(context, vaddr))
+				// shared, not copied: handled by the mmap inheritance block below
+				vaddr = (get_page_of_virtual_address(vaddr) + 1) * PAGESIZE;
+			else {
+				map_and_store (child, vaddr, load_virtual_memory(get_pt(context), vaddr));
+				vaddr = vaddr + WORDSIZE;
+			}
+		} else
+			// unmapped page (gap between segments): skip the whole page
+			vaddr = (get_page_of_virtual_address(vaddr) + 1) * PAGESIZE;
 	}
 	
 	/* Copy page bounds */
