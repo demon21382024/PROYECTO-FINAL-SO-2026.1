@@ -1306,7 +1306,9 @@ void implement_msync(uint64_t* context);
 void      init_page_cache();
 uint64_t* alloc_cache_frame();
 uint64_t* find_cache_frame(uint64_t file_id, uint64_t page_offset);
+uint64_t* find_cache_entry(uint64_t file_id, uint64_t page_offset);
 void      insert_cache_entry(uint64_t file_id, uint64_t page_offset, uint64_t* frame);
+void      mark_mmap_dirty(uint64_t* context, uint64_t vaddr);
 
 uint64_t is_boot_level_zero();
 
@@ -2432,6 +2434,7 @@ uint64_t is_heap_address(uint64_t* context, uint64_t vaddr);
 uint64_t is_address_between_stack_and_heap(uint64_t* context, uint64_t vaddr);
 uint64_t is_data_stack_heap_address(uint64_t* context, uint64_t vaddr);
 uint64_t is_mmap_address(uint64_t* context, uint64_t vaddr);
+uint64_t mmap_allows_write(uint64_t* context, uint64_t vaddr);
 
 uint64_t is_valid_segment_read(uint64_t vaddr);
 uint64_t is_valid_segment_write(uint64_t vaddr);
@@ -8311,12 +8314,56 @@ uint64_t* find_cache_frame(uint64_t file_id, uint64_t page_offset) {
 void insert_cache_entry(uint64_t file_id, uint64_t page_offset, uint64_t* frame) {
   uint64_t* entry;
 
-  entry = smalloc(4 * sizeof(uint64_t));
+  // entry layout: [file_id, page_offset, frame, next, dirty]
+  entry = smalloc(5 * sizeof(uint64_t));
   *(entry + 0) = file_id;
   *(entry + 1) = page_offset;
   *(entry + 2) = (uint64_t) frame;
-  *(entry + 3) = (uint64_t) page_cache_head;
+  *(entry + 3) = (uint64_t) page_cache_head; // next
+  *(entry + 4) = 0;                          // dirty bit (0 = clean)
   page_cache_head = entry;
+}
+
+// like find_cache_frame but returns the whole entry (to read/set its dirty bit)
+uint64_t* find_cache_entry(uint64_t file_id, uint64_t page_offset) {
+  uint64_t* entry;
+
+  entry = page_cache_head;
+  while (entry != (uint64_t*) 0) {
+    if (*(entry + 0) == file_id)
+      if (*(entry + 1) == page_offset)
+        return entry;
+    entry = (uint64_t*) *(entry + 3);
+  }
+
+  return (uint64_t*) 0;
+}
+
+// mark the cache frame backing vaddr (in some mapping of context) as dirty
+void mark_mmap_dirty(uint64_t* context, uint64_t vaddr) {
+  uint64_t* m;
+  uint64_t m_start;
+  uint64_t m_end;
+  uint64_t page_start;
+  uint64_t file_offset;
+  uint64_t* entry;
+
+  m = get_mappings(context);
+  while (m != (uint64_t*) 0) {
+    m_start = *(m + 1);
+    m_end   = m_start + *(m + 2);
+    if (vaddr >= m_start)
+      if (vaddr < m_end) {
+        // page-aligned file offset, same formula as handle_page_fault
+        page_start  = get_virtual_address_of_page_start(get_page_of_virtual_address(vaddr));
+        file_offset = *(m + 4) + (page_start - m_start);
+        entry = find_cache_entry(*(m + 3), file_offset);
+        if (entry != (uint64_t*) 0)
+          *(entry + 4) = 1; // dirty
+        return;
+      }
+    m = (uint64_t*) *(m + 0);
+  }
 }
 
 // -----------------------------------------------------------------
@@ -8563,7 +8610,7 @@ void implement_msync(uint64_t* context) {
   uint64_t m_fd;
   uint64_t m_off;
   uint64_t pg;
-  uint64_t* frame;
+  uint64_t* entry;
 
   addr = *(get_regs(context) + REG_A0);
 
@@ -8578,13 +8625,19 @@ void implement_msync(uint64_t* context) {
       m_fd    = *(mapping + 3);
       m_off   = *(mapping + 4);
 
-      // write each cache frame back to the file
+      // write back only DIRTY cache frames (dirty-bit optimization)
       pg = 0;
       while (pg < m_len) {
-        frame = find_cache_frame(m_fd, m_off + pg);
-        if (frame != (uint64_t*) 0) {
-          lseek(m_fd, m_off + pg, 0);
-          write(m_fd, frame, PAGESIZE);
+        entry = find_cache_entry(m_fd, m_off + pg);
+        if (entry != (uint64_t*) 0) {
+          if (*(entry + 4) == 1) {
+            // dirty: persist to disk and clear the bit
+            lseek(m_fd, m_off + pg, 0);
+            write(m_fd, (uint64_t*) *(entry + 2), PAGESIZE);
+            *(entry + 4) = 0;
+            printf("%s: msync wrote dirty page (fd=%lu offset=%lu)\n", selfie_name, m_fd, m_off + pg);
+          } else
+            printf("%s: msync skipped clean page (fd=%lu offset=%lu)\n", selfie_name, m_fd, m_off + pg);
         }
         pg = pg + PAGESIZE;
       }
@@ -10352,6 +10405,10 @@ uint64_t do_store() {
             store_cached_virtual_memory(pt, vaddr, *(registers + rs2));
         }
 
+        // dirty-bit: if this store hit an mmap region, mark its frame dirty
+        if (get_mappings(current_context) != (uint64_t*) 0)
+          mark_mmap_dirty(current_context, vaddr);
+
         // keep track of instruction address for profiling stores
         a = (pc - code_start) / INSTRUCTIONSIZE;
 
@@ -11983,6 +12040,26 @@ uint64_t is_mmap_address(uint64_t* context, uint64_t vaddr) {
   return 0;
 }
 
+// returns 1 if vaddr is in a writable mapping (prot != 0), 0 if read-only
+uint64_t mmap_allows_write(uint64_t* context, uint64_t vaddr) {
+  uint64_t* m;
+  uint64_t m_start;
+  uint64_t m_end;
+
+  m = get_mappings(context);
+  while (m != (uint64_t*) 0) {
+    m_start = *(m + 1);
+    m_end   = m_start + *(m + 2);
+    if (vaddr >= m_start)
+      if (vaddr < m_end)
+        // prot: 0 = read-only, 1 = write, 2 = read/write
+        return *(m + 5) != 0;
+    m = (uint64_t*) *(m + 0);
+  }
+
+  return 1; // not in any mapping: do not restrict here
+}
+
 uint64_t is_valid_segment_read(uint64_t vaddr) {
   if (is_data_address(current_context, vaddr)) {
     data_reads = data_reads + 1;
@@ -12016,7 +12093,8 @@ uint64_t is_valid_segment_write(uint64_t vaddr) {
 
     return 1;
   } else if (is_mmap_address(current_context, vaddr)) {
-    return 1;
+    // enforce prot: writing to a read-only mapping (prot == 0) is rejected
+    return mmap_allows_write(current_context, vaddr);
   } else
     return 0;
 }

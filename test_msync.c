@@ -15,7 +15,7 @@ int main() {
         return 1;
     }
 
-    mapped_mem = mmap(0, 4096, 0, fd, 0);
+    mapped_mem = mmap(0, 4096, 2, fd, 0);
     if (mapped_mem == 4294967295) {
         return 2;
     }
