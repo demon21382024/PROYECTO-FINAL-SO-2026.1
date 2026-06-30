@@ -1302,6 +1302,9 @@ void implement_munmap(uint64_t* context);
 void emit_msync();
 void implement_msync(uint64_t* context);
 
+void emit_lseek();
+void implement_lseek(uint64_t* context);
+
 // page cache functions
 void      init_page_cache();
 uint64_t* alloc_cache_frame();
@@ -1322,6 +1325,7 @@ uint64_t debug_brk   = 0;
 uint64_t SYSCALL_EXIT   = 93;
 uint64_t SYSCALL_READ   = 63;
 uint64_t SYSCALL_WRITE  = 64;
+uint64_t SYSCALL_LSEEK  = 62;
 uint64_t SYSCALL_OPENAT = 56;
 uint64_t SYSCALL_BRK    = 214;
 
@@ -6378,6 +6382,7 @@ void selfie_compile() {
   emit_exit();
   emit_read();
   emit_write();
+  emit_lseek();
   emit_fork();
   emit_wait();
   emit_open();
@@ -7871,6 +7876,52 @@ void implement_write(uint64_t* context) {
   }
 }
 
+void emit_lseek() {
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("lseek"),
+    0, PROCEDURE, UINT64_T, 3, code_size);
+
+  emit_load(REG_A0, REG_SP, 0); // fd
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A1, REG_SP, 0); // offset
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A2, REG_SP, 0); // whence
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_LSEEK);
+
+  emit_ecall();
+
+  // return value is in REG_A0 (the resulting file offset)
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void implement_lseek(uint64_t* context) {
+  // parameters
+  uint64_t fd;
+  uint64_t offset;
+  uint64_t whence;
+
+  fd     = *(get_regs(context) + REG_A0);
+  offset = *(get_regs(context) + REG_A1);
+  whence = *(get_regs(context) + REG_A2);
+
+  if (debug_syscalls)
+    printf("(lseek): fd=%lu offset=%lu whence=%lu |- ", fd, offset, whence);
+
+  // lseek only repositions the file offset; there is no user buffer to copy
+  *(get_regs(context) + REG_A0) = lseek(fd, offset, whence);
+
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+
+  if (debug_syscalls) {
+    printf(" -> ");
+    print_register_value(REG_A0);
+    println();
+  }
+}
+
 void emit_open() {
   create_symbol_table_entry(GLOBAL_TABLE, string_copy("open"),
     0, PROCEDURE, UINT64_T, 3, code_size);
@@ -8101,7 +8152,17 @@ void implement_fork(uint64_t* context) {
 	uint64_t i;
 	uint64_t page;
 	uint64_t vaddr;
-	
+	// locals for the mmap mapping inheritance below
+	// (declared here because selfie's C* only allows local
+	//  variable declarations at the start of a procedure)
+	uint64_t* pm;
+	uint64_t* cm_head;
+	uint64_t* cm;
+	uint64_t m_vaddr;
+	uint64_t m_len;
+	uint64_t pg;
+	uint64_t* fr;
+
 	child = create_context (MY_CONTEXT, 0);
 	
 	/* Set current context pid as parent pid */
@@ -8180,44 +8241,34 @@ void implement_fork(uint64_t* context) {
 	set_nchildren(context, get_nchildren(context) + 1);
 
 	/* Inherit mmap mappings: copy list and share cache frames */
-	{
-		uint64_t* pm;
-		uint64_t* cm_head;
-		uint64_t* cm;
-		uint64_t m_vaddr;
-		uint64_t m_len;
-		uint64_t pg;
-		uint64_t* fr;
+	pm = get_mappings(context);
+	cm_head = (uint64_t*) 0;
 
-		pm = get_mappings(context);
-		cm_head = (uint64_t*) 0;
+	while (pm != (uint64_t*) 0) {
+		cm = smalloc(6 * sizeof(uint64_t));
+		*(cm + 0) = (uint64_t) cm_head;
+		*(cm + 1) = *(pm + 1);
+		*(cm + 2) = *(pm + 2);
+		*(cm + 3) = *(pm + 3);
+		*(cm + 4) = *(pm + 4);
+		*(cm + 5) = *(pm + 5);
+		cm_head = cm;
 
-		while (pm != (uint64_t*) 0) {
-			cm = smalloc(6 * sizeof(uint64_t));
-			*(cm + 0) = (uint64_t) cm_head;
-			*(cm + 1) = *(pm + 1);
-			*(cm + 2) = *(pm + 2);
-			*(cm + 3) = *(pm + 3);
-			*(cm + 4) = *(pm + 4);
-			*(cm + 5) = *(pm + 5);
-			cm_head = cm;
-
-			m_vaddr = *(pm + 1);
-			m_len   = *(pm + 2);
-			pg = 0;
-			while (pg < m_len) {
-				if (is_virtual_address_mapped(get_pt(context), m_vaddr + pg)) {
-					fr = (uint64_t*) get_frame_for_page(get_pt(context), get_page_of_virtual_address(m_vaddr + pg));
-					map_page(child, get_page_of_virtual_address(m_vaddr + pg), (uint64_t) fr);
-				}
-				pg = pg + PAGESIZE;
+		m_vaddr = *(pm + 1);
+		m_len   = *(pm + 2);
+		pg = 0;
+		while (pg < m_len) {
+			if (is_virtual_address_mapped(get_pt(context), m_vaddr + pg)) {
+				fr = (uint64_t*) get_frame_for_page(get_pt(context), get_page_of_virtual_address(m_vaddr + pg));
+				map_page(child, get_page_of_virtual_address(m_vaddr + pg), (uint64_t) fr);
 			}
-
-			pm = (uint64_t*) *(pm + 0);
+			pg = pg + PAGESIZE;
 		}
 
-		set_mappings(child, cm_head);
+		pm = (uint64_t*) *(pm + 0);
 	}
+
+	set_mappings(child, cm_head);
 
 	*(get_regs(context) + REG_A0) = get_pid(child);
 	*(get_regs(child) + REG_A0) = 0;
@@ -8422,6 +8473,8 @@ void implement_mmap(uint64_t* context) {
   uint64_t* existing;
   uint64_t candidate;
   uint64_t conflict;
+  uint64_t ex_start;
+  uint64_t ex_end;
 
   addr   = *(get_regs(context) + REG_A0);
   length = *(get_regs(context) + REG_A1);
@@ -8464,8 +8517,6 @@ void implement_mmap(uint64_t* context) {
       conflict = 0;
       existing = get_mappings(context);
       while (existing != (uint64_t*) 0) {
-        uint64_t ex_start;
-        uint64_t ex_end;
         ex_start = *(existing + 1);
         ex_end   = ex_start + *(existing + 2);
         if (candidate < ex_end)
@@ -12322,6 +12373,8 @@ uint64_t handle_system_call(uint64_t* context) {
     implement_read(context);
   else if (a7 == SYSCALL_WRITE)
     implement_write(context);
+  else if (a7 == SYSCALL_LSEEK)
+    implement_lseek(context);
   else if (a7 == SYSCALL_OPENAT)
     implement_openat(context);
   else if (a7 == SYSCALL_FORK)
